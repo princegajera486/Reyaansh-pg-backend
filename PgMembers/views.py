@@ -5,10 +5,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
+from django.core.cache import cache
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+from DashBoard.cloudinary_client import upload_image_full
 
 
 load_dotenv()
@@ -20,16 +22,60 @@ adapter = HTTPAdapter(pool_connections=30, pool_maxsize=30)
 http_session.mount("https://", adapter)
 http_session.mount("http://", adapter)
 
+def process_cloudinary_image(raw_val, folder="members"):
+    """
+    Uploads an image file object, base64 string, or remote image URL to Cloudinary.
+    Returns tuple of (cloudinary_public_id, cloudinary_secure_url).
+    """
+    if not raw_val:
+        return None, None
+    try:
+        # Check if it's an uploaded file object or base64 data string
+        if hasattr(raw_val, 'read') or hasattr(raw_val, 'chunks') or (isinstance(raw_val, str) and (raw_val.startswith("data:image/") or len(raw_val) > 500)):
+            res = upload_image_full(raw_val, folder=folder)
+            if res and res.get("public_id"):
+                return res["public_id"], res["secure_url"]
+            return None, None
+        elif isinstance(raw_val, str):
+            val_str = raw_val.strip()
+            if not val_str:
+                return None, None
+            if val_str.startswith("http://") or val_str.startswith("https://"):
+                # Upload remote image to Cloudinary to generate a Cloudinary public_id
+                res = upload_image_full(val_str, folder=folder)
+                if res and res.get("public_id"):
+                    return res["public_id"], res["secure_url"]
+                return val_str, val_str
+            else:
+                # It is already a Cloudinary public_id
+                cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "")
+                secure_url = f"https://res.cloudinary.com/{cloud_name}/image/upload/{val_str}" if cloud_name else val_str
+                return val_str, secure_url
+    except Exception as e:
+        print(f"Cloudinary image processing error: {e}")
+        return None, None
+    return None, None
+
 def fetch_nodes_parallel(url_dict):
     """
     Fetches multiple Firebase URLs concurrently using thread pool.
     """
     def fetch_one(item):
         key, url = item
+        
+        # Check cache first
+        cache_key = f"firebase_{url}"
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return key, cached_data
+            
         try:
-            res = http_session.get(url, timeout=5)
+            res = http_session.get(url, timeout=10)
             if res.status_code == 200 and res.json():
-                return key, res.json()
+                data = res.json()
+                # Cache for 30 seconds
+                cache.set(cache_key, data, timeout=30)
+                return key, data
         except Exception:
             pass
         return key, {}
@@ -58,11 +104,15 @@ class MemberView(APIView):
         member_id = request.query_params.get("member_id") or request.query_params.get("id")
         
         try:
-            # Parallel fetch of rent records and pg properties
-            nodes = fetch_nodes_parallel({
+            fetch_dict = {
                 "rent": f"{DATABASE_URL}/rent_records.json",
                 "pgs": f"{DATABASE_URL}/pg_properties.json"
-            })
+            }
+            if not member_id:
+                fetch_dict["members"] = f"{DATABASE_URL}/members.json"
+
+            # Parallel fetch
+            nodes = fetch_nodes_parallel(fetch_dict)
             rent_records = nodes["rent"]
             pg_properties = nodes["pgs"]
 
@@ -120,10 +170,7 @@ class MemberView(APIView):
             joining_date_param = request.query_params.get("joining_date") or request.query_params.get("created_at") or request.headers.get("joining_date")
 
             # --- ALL MEMBERS (PAGINATED & FILTERED) ---
-            url = f"{DATABASE_URL}/members.json"
-            res = http_session.get(url)
-            res.raise_for_status()
-            members_dict = res.json() or {}
+            members_dict = nodes.get("members", {})
 
             formatted_members = []
 
@@ -248,12 +295,24 @@ class MemberView(APIView):
 
     def post(self, request):
         data = request.data
+        files = request.FILES
 
         if not DATABASE_URL:
             return Response(
                 {"detail": "Firebase database URL is not configured."},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+        # Extract mandatory images (member_img and aadhaar_card_img) from request FILES or data
+        member_img_raw = (
+            files.get("member_img") or files.get("member_image") or files.get("profile_img") or files.get("profile_image") or files.get("member_photo") or
+            data.get("member_img") or data.get("member_image") or data.get("profile_img") or data.get("profile_image") or data.get("member_photo")
+        )
+
+        aadhaar_img_raw = (
+            files.get("aadhaar_card_img") or files.get("aadhaar_img") or files.get("aadhaar_card_image") or files.get("aadhaar_card") or files.get("aadhar_card_img") or files.get("aadhar_img") or
+            data.get("aadhaar_card_img") or data.get("aadhaar_img") or data.get("aadhaar_card_image") or data.get("aadhaar_card") or data.get("aadhar_card_img") or data.get("aadhar_img")
+        )
 
         # 1. Validate Required Fields
         required_fields = [
@@ -268,6 +327,11 @@ class MemberView(APIView):
         
         missing_fields = [field for field in required_fields if data.get(field) in [None, ""]]
         
+        if not member_img_raw:
+            missing_fields.append("member_img")
+        if not aadhaar_img_raw:
+            missing_fields.append("aadhaar_card_img")
+
         pg_type = str(data.get("pg_type", ""))
         status_val = str(data.get("status", ""))
         
@@ -281,6 +345,21 @@ class MemberView(APIView):
         if missing_fields:
             return Response(
                 {"detail": f"Missing required fields: {', '.join(missing_fields)}"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Upload mandatory images to Cloudinary
+        member_img_id, member_img_url = process_cloudinary_image(member_img_raw, folder="members/profile_images")
+        if not member_img_id:
+            return Response(
+                {"detail": "Failed to upload member_img to Cloudinary. Please provide a valid image file, base64 string, or Cloudinary ID."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        aadhaar_img_id, aadhaar_img_url = process_cloudinary_image(aadhaar_img_raw, folder="members/aadhaar_cards")
+        if not aadhaar_img_id:
+            return Response(
+                {"detail": "Failed to upload aadhaar_card_img to Cloudinary. Please provide a valid image file, base64 string, or Cloudinary ID."},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -318,8 +397,14 @@ class MemberView(APIView):
             "gender": str(data.get("gender")),
             "company_college_name": str(data.get("company_college_name")),
             
-            # Identity Verification
+            # Identity Verification & Images (Stored in Cloudinary, Cloudinary ID stored in Firebase)
             "aadhaar_number": str(data.get("aadhaar_number")),
+            "member_img": member_img_id,
+            "member_img_id": member_img_id,
+            "member_img_url": member_img_url,
+            "aadhaar_card_img": aadhaar_img_id,
+            "aadhaar_card_img_id": aadhaar_img_id,
+            "aadhaar_card_img_url": aadhaar_img_url,
             
             # Emergency Contact
             "emergency_contact_name": str(data.get("emergency_contact_name")),
@@ -357,6 +442,12 @@ class MemberView(APIView):
         if "alternate_mobile_number" in data and data.get("alternate_mobile_number"):
             payload["alternate_mobile_number"] = str(data.get("alternate_mobile_number"))
         if "email" in data and data.get("email"):
+            payload["email"] = str(data.get("email"))
+        elif "email_id" in data and data.get("email_id"):
+            payload["email"] = str(data.get("email_id"))
+        elif "emailId" in data and data.get("emailId"):
+            payload["email"] = str(data.get("emailId"))
+        if False:
             payload["email"] = str(data.get("email"))
         if "pan_number" in data and data.get("pan_number"):
             payload["pan_number"] = str(data.get("pan_number"))
@@ -456,6 +547,36 @@ class MemberView(APIView):
         # Append member_id to response payload
         payload["member_id"] = member_id
         
+        # 7. Auto-send Calendar Reminder ONLY to the newly added member if email is provided
+        # Support optional send_email / send_welcome_email flag (defaults to True)
+        send_email_option = data.get("send_email", data.get("send_welcome_email", data.get("sendEmail", True)))
+        if isinstance(send_email_option, str):
+            should_send_email = send_email_option.lower() not in ("false", "0", "no")
+        else:
+            should_send_email = bool(send_email_option)
+
+        email = payload.get("email")
+        if email and should_send_email:
+            try:
+                from DashBoard.views import SendCalendarReminderView
+                class MockRequest:
+                    def __init__(self, req_data):
+                        self.data = req_data
+                
+                full_name = payload.get("full_name", "Member")
+                mock_req = MockRequest({
+                    "email": email,
+                    "member_id": member_id,
+                    "title": "Welcome! Monthly Rent Reminder",
+                    "description": f"Welcome {full_name} to the PG! This is an automated calendar reminder for your monthly rent payment."
+                })
+                # Trigger background thread in calendar view ONLY for this specific new member
+                SendCalendarReminderView().post(mock_req)
+                print(f"Triggered welcome reminder email ONLY for new member {member_id} ({email})")
+            except Exception as e:
+                print(f"Failed to auto-send calendar reminder to new member {member_id}: {e}")
+                
+
         return Response({
             "message": "Member created successfully",
             "member_id": member_id,
@@ -510,6 +631,7 @@ class MemberView(APIView):
 
         # 2. Update fields
         update_data = existing_member.copy()
+        files = request.FILES
         
         for key, value in data.items():
             if key not in ["member_id", "created_at"] and value is not None and str(value).strip() != "":
@@ -518,6 +640,31 @@ class MemberView(APIView):
                 else:
                     update_data[key] = str(value)
                     
+        # Process image updates if provided
+        member_img_raw = (
+            files.get("member_img") or files.get("member_image") or files.get("profile_img") or files.get("profile_image") or files.get("member_photo") or
+            data.get("member_img") or data.get("member_image") or data.get("profile_img") or data.get("profile_image") or data.get("member_photo")
+        )
+
+        aadhaar_img_raw = (
+            files.get("aadhaar_card_img") or files.get("aadhaar_img") or files.get("aadhaar_card_image") or files.get("aadhaar_card") or files.get("aadhar_card_img") or files.get("aadhar_img") or
+            data.get("aadhaar_card_img") or data.get("aadhaar_img") or data.get("aadhaar_card_image") or data.get("aadhaar_card") or data.get("aadhar_card_img") or data.get("aadhar_img")
+        )
+
+        if member_img_raw:
+            m_id, m_url = process_cloudinary_image(member_img_raw, folder="members/profile_images")
+            if m_id:
+                update_data["member_img"] = m_id
+                update_data["member_img_id"] = m_id
+                update_data["member_img_url"] = m_url
+
+        if aadhaar_img_raw:
+            a_id, a_url = process_cloudinary_image(aadhaar_img_raw, folder="members/aadhaar_cards")
+            if a_id:
+                update_data["aadhaar_card_img"] = a_id
+                update_data["aadhaar_card_img_id"] = a_id
+                update_data["aadhaar_card_img_url"] = a_url
+
         update_data["updated_at"] = get_ist_now()
 
         new_pg_type = update_data.get("pg_type")
@@ -808,18 +955,90 @@ class PgAvailabilityView(APIView):
                     "total_beds": total_beds,
                     "occupied_beds": occupied_beds,
                     "available_beds": available_beds_count,
-                    "available_rooms": available_rooms
+                    "images": pg.get("images", [])
                 })
 
             return Response({
                 "message": "Available PGs fetched successfully",
-                "total_active_pgs": len(availability_list),
+                "total_records": len(availability_list),
                 "data": availability_list
             }, status=status.HTTP_200_OK)
 
         except requests.exceptions.RequestException as e:
             return Response(
-                {"detail": f"Failed to fetch availability from Firebase: {str(e)}"},
+                {"detail": f"Failed to fetch PG availability: {str(e)}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+class VerifyCheckPaymentView(APIView):
+    """
+    POST API to verify payment by check.
+    Updates the rent_records node for the member to set status = 'paid'.
+    """
+    def post(self, request):
+        member_id = request.data.get("member_id")
+        check_number = request.data.get("check_number", "")
+        amount = request.data.get("amount")
+        
+        if not member_id:
+            return Response({"detail": "member_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+            
+        if not DATABASE_URL:
+            return Response(
+                {"detail": "Firebase database URL is not configured."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+            
+        rent_record_url = f"{DATABASE_URL}/rent_records/{member_id}.json"
+        
+        try:
+            # 1. Fetch existing rent record
+            rent_res = http_session.get(rent_record_url)
+            rent_data = rent_res.json()
+            
+            if not rent_data:
+                 return Response({"detail": "Rent record not found for this member."}, status=status.HTTP_404_NOT_FOUND)
+                 
+            # 2. Update rent status
+            patch_data = {
+                "status": "paid",
+                "payment_method": "check",
+                "updated_at": get_ist_now()
+            }
+            if check_number:
+                patch_data["check_number"] = str(check_number)
+            if amount is not None:
+                patch_data["amount_paid"] = amount
+                
+            update_res = http_session.patch(rent_record_url, json=patch_data)
+            update_res.raise_for_status()
+            
+            # 3. Add to payments node for dashboard history
+            try:
+                payment_id = f"PAY_{int(datetime.now().timestamp())}_{member_id}"
+                payment_url = f"{DATABASE_URL}/payments/{payment_id}.json"
+                payment_data = {
+                    "payment_id": payment_id,
+                    "member_id": member_id,
+                    "pg_id": rent_data.get("pg_id", ""),
+                    "amount": amount if amount is not None else rent_data.get("monthly_rent", 0),
+                    "payment_method": "check",
+                    "check_number": str(check_number),
+                    "status": "paid",
+                    "created_at": get_ist_now()
+                }
+                http_session.put(payment_url, json=payment_data)
+            except Exception as e:
+                pass # Non-critical if it fails to log history
+                
+            return Response({
+                "message": "Payment verified by check successfully.", 
+                "member_id": member_id,
+                "status": "paid"
+            }, status=status.HTTP_200_OK)
+            
+        except requests.exceptions.RequestException as e:
+            return Response(
+                {"detail": f"Failed to verify payment: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )

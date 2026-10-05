@@ -5,6 +5,7 @@ from requests.adapters import HTTPAdapter
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
+from django.core.cache import cache
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -24,6 +25,20 @@ http_session.mount("http://", adapter)
 def get_ist_now():
     """Returns current time in Indian Standard Time (IST)"""
     return datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
+
+def get_cached_pg_properties():
+    """Helper to fetch and cache all PG properties for 30 seconds to speed up listing and filter APIs."""
+    cache_key = "firebase_pg_properties_all"
+    cached_data = cache.get(cache_key)
+    if cached_data is not None:
+        return cached_data
+        
+    url = f"{DATABASE_URL}/pg_properties.json"
+    res = http_session.get(url, timeout=10)
+    res.raise_for_status()
+    data = res.json() or {}
+    cache.set(cache_key, data, timeout=30)
+    return data
 
 class AddPgPropertyView(APIView):
     """
@@ -378,12 +393,8 @@ class AddPgPropertyView(APIView):
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR
                 )
             
-        url = f"{DATABASE_URL}/pg_properties.json"
-        
         try:
-            response = http_session.get(url)
-            response.raise_for_status()
-            data = response.json()
+            data = get_cached_pg_properties()
             
             if not data:
                 return Response({
@@ -575,12 +586,8 @@ class GetCitiesView(APIView):
         # Optional state filter
         f_state = request.GET.get("state") or request.headers.get("state")
         
-        url = f"{DATABASE_URL}/pg_properties.json"
-        
         try:
-            response = http_session.get(url)
-            response.raise_for_status()
-            data = response.json()
+            data = get_cached_pg_properties()
             
             if not data:
                 return Response([], status=status.HTTP_200_OK)

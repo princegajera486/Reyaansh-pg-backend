@@ -8,6 +8,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
+from django.core.cache import cache
 
 from .security import hash_password, create_token, JWTAuthentication, verify_token
 from .firebase_client import get_admin_user, create_admin_user, update_last_login, update_admin_profile
@@ -27,10 +28,20 @@ def fetch_nodes_parallel(url_dict):
     """
     def fetch_one(item):
         key, url = item
+        
+        # Check cache first
+        cache_key = f"firebase_{url}"
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return key, cached_data
+            
         try:
-            res = http_session.get(url, timeout=5)
+            res = http_session.get(url, timeout=10)
             if res.status_code == 200 and res.json():
-                return key, res.json()
+                data = res.json()
+                # Cache for 30 seconds
+                cache.set(cache_key, data, timeout=30)
+                return key, data
         except Exception:
             pass
         return key, {}
@@ -161,9 +172,11 @@ class RefreshTokenView(APIView):
         if not refresh_token:
             return Response({"detail": "Refresh token missing"}, status=status.HTTP_401_UNAUTHORIZED)
             
-        payload = verify_token(refresh_token)
-        if not payload or payload.get("type") != "refresh":
-            return Response({"detail": "Invalid or expired refresh token"}, status=status.HTTP_401_UNAUTHORIZED)
+        payload, error = verify_token(refresh_token)
+        if error == "expired":
+            return Response({"detail": "Refresh token expired", "code": "token_expired"}, status=status.HTTP_401_UNAUTHORIZED)
+        if error == "invalid" or not payload or payload.get("type") != "refresh":
+            return Response({"detail": "Invalid refresh token", "code": "token_not_valid"}, status=status.HTTP_401_UNAUTHORIZED)
             
         username = payload.get("sub")
         
@@ -488,7 +501,13 @@ class DashboardKPIView(APIView):
                                 total_beds += len(beds)
                                 for b_id, b_info in beds.items():
                                     if isinstance(b_info, dict) and b_info.get("is_occupied"):
-                                        occupied_beds += 1
+                                        mem_id = b_info.get("member_id")
+                                        if mem_id and mem_id in members_data:
+                                            mem = members_data[mem_id]
+                                            if not mem.get("is_deleted") and mem.get("status") not in ["Inactive", "Deleted"]:
+                                                occupied_beds += 1
+                                        elif not mem_id:
+                                            occupied_beds += 1
 
             total_members = 0
             active_members = 0
@@ -510,8 +529,7 @@ class DashboardKPIView(APIView):
                     continue
 
                 m_dt = m_info.get("created_at") or m_info.get("joining_date")
-                if not match_date_filter(m_dt, filters):
-                    continue
+                # Removed date filter for snapshot metric (Total Members) so it matches absolute occupied beds
 
                 total_members += 1
                 if m_status == "Active":
@@ -647,7 +665,13 @@ class DashboardChartsView(APIView):
                                 total_beds += len(beds)
                                 for b_id, b_info in beds.items():
                                     if isinstance(b_info, dict) and b_info.get("is_occupied"):
-                                        occupied_beds += 1
+                                        mem_id = b_info.get("member_id")
+                                        if mem_id and mem_id in members_data:
+                                            mem = members_data[mem_id]
+                                            if not mem.get("is_deleted") and mem.get("status") not in ["Inactive", "Deleted"]:
+                                                occupied_beds += 1
+                                        elif not mem_id:
+                                            occupied_beds += 1
 
             vacant_beds = max(0, total_beds - occupied_beds)
 
@@ -686,8 +710,7 @@ class DashboardChartsView(APIView):
                     continue
 
                 created_at = m_info.get("created_at") or m_info.get("joining_date", "")
-                if not match_date_filter(created_at, filters):
-                    continue
+                # Removed date filter for snapshot metrics so member distribution is accurate
 
                 is_deleted = m_info.get("is_deleted")
                 rent_val = 0

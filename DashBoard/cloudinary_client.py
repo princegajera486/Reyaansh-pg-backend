@@ -30,6 +30,26 @@ def upload_image(file, folder="screenshots"):
         print(f"Cloudinary image upload failed: {e}")
         return None
 
+def upload_image_full(file, folder="members"):
+    """
+    Uploads an image file (e.g., member photo, aadhaar card) to Cloudinary.
+    Returns dict with 'public_id' and 'secure_url' or None on failure.
+    """
+    try:
+        response = cloudinary.uploader.upload(
+            file,
+            folder=folder,
+            resource_type="image"
+        )
+        return {
+            "public_id": response.get("public_id"),
+            "secure_url": response.get("secure_url"),
+            "url": response.get("url")
+        }
+    except Exception as e:
+        print(f"Cloudinary image upload failed: {e}")
+        return None
+
 def upload_pdf(file, folder="pdfs"):
     """
     Uploads a PDF document to Cloudinary.

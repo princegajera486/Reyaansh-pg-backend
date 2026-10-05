@@ -21,9 +21,11 @@ def create_token(data: dict, expires_delta: timedelta):
 def verify_token(token: str):
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        return payload
+        return payload, None
+    except jwt.ExpiredSignatureError:
+        return None, "expired"
     except jwt.PyJWTError:
-        return None
+        return None, "invalid"
 
 class JWTAuthentication(BaseAuthentication):
     def authenticate(self, request):
@@ -43,12 +45,14 @@ class JWTAuthentication(BaseAuthentication):
         if not token:
             return None
             
-        payload = verify_token(token)
-        if not payload:
-            raise AuthenticationFailed('Invalid or expired token')
+        payload, error = verify_token(token)
+        if error == "expired":
+            raise AuthenticationFailed('Token has expired', code='token_expired')
+        if error == "invalid" or not payload:
+            raise AuthenticationFailed('Invalid token', code='token_not_valid')
             
         # Ensure it's an access token
         if payload.get("type") != "access":
-            raise AuthenticationFailed('Invalid token type')
+            raise AuthenticationFailed('Invalid token type', code='invalid_type')
             
         return (payload, token)
